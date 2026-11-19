@@ -13,24 +13,29 @@ Forecasts each Grand Theft Auto VI PS5 trophy's Exophase earn rate at
 `main.ts` (Node 22, standard library only) reads a case file and writes one
 forecast file. The model, in brief:
 
-- **Logit-rate trend, refresh-aware.** Each trophy's logit earn rate is fitted
-  against log-time using only within-refresh-segment variation, so the slope
-  measures pure unlock growth — dilution steps from tracker refreshes are
-  removed by demeaning inside each constant-player segment. Slopes are
-  precision-shrunk toward their tier mean (platinum/gold/silver/bronze),
-  tier means toward the global mean. Forecasts anchor at the last read.
-- **Refresh-kappa scenario mixture.** A refresh multiplies the tracked-player
-  count, diluting every rate. The forecast is a mixture over scenarios: no
-  refresh before the target (probability from a hazard model fitted to the
-  observed refreshes, with a prior when history is flat), or a refresh with a
-  total dilution factor drawn from a lognormal fitted to observed jumps (or a
-  prior). Each scenario shifts the logit forecast by the exact dilution shift,
-  with an earner-import correction estimated from past refreshes — saturated
-  trophies (rate ≥ 99.5%) stay saturated, since new players hold them at once.
-- **Honest quantiles from one distribution.** All five quantiles are read off
-  the mixture CDF on a logit grid. Pinball loss on the logit scale is a proper
-  scoring rule, so the forecast reports the quantiles it believes — it does not
-  bet everything on one branch.
+- **Rate-dependent refresh shift.** A refresh jumps the tracked-player
+  count and shifts every rate down — but not by a flat factor: rare trophies
+  dilute almost purely, common ones barely fall (new players earn common
+  trophies fast). Each refresh shifts logit(rate) by
+  `import(L) * (kappa-1)/5.06 - ln(kappa)`, where kappa is that refresh's
+  player jump and `import(L) = a + b*L` is the earner import from the new
+  players. (a, b) are estimated from the refreshes observed in the case's
+  own history (corrected weighted regression), shrunk toward a prior
+  fitted from our own scored entry (a=1.302, b=0.24 — at a 6.06x jump this
+  reproduces the fitted shift law s = -0.50 + 0.24*logit(rate)). Future
+  refreshes are counted by a renewal-style rule (next refresh due from
+  staleness, then Poisson), total player growth is extrapolated by a
+  power law, and shifts are compounded step by step.
+- **Logit-rate trend.** Each trophy's logit earn rate is fitted against
+  log-time using only within-refresh-segment variation, so the slope
+  measures pure unlock growth. Slopes are shrunk toward their tier mean
+  (platinum/gold/silver/bronze) and clamped >= 0. On launch night the
+  history is flat so the trend is 0 and the refresh shift does the work.
+- **Narrow asymmetric quantiles.** All five quantiles come from a
+  Normal-in-logit fan around the median, wider below than above (refreshes
+  only push rates down), with sigma from trend + refresh-count + parameter
+  + partition uncertainty — about 0.5 logit wide (q05-q95) on a 90-minute
+  horizon, wider on the 4.5-day final.
 
 ## Run locally
 

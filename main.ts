@@ -1,422 +1,560 @@
-// gta6-trophy-rarity-forecast-01 — account 1 (@bayuanwar8)
-// LOGIT-RATE TREND + REFRESH-KAPPA mixture forecaster (Node 22, stdlib only).
+// GTA VI trophy rarity forecaster v2 — rate-dependent refresh shift + trend.
 //
-// Model, built fresh (reasoning in README.md):
-//  * Per trophy, fit logit(rate) against log-time using ONLY within-refresh-segment
-//    variation, so the slope is pure unlock growth: refresh dilution steps are
-//    removed by segment demeaning. Slopes are precision-shrunk toward tier means,
-//    tier means toward the global mean. The forecast anchors at the last read.
-//  * Refreshes are a scenario mixture: with probability q0 no refresh lands before
-//    the target; otherwise the tracked-player count grows by a total factor D
-//    (lognormal, fitted from observed jumps or a prior). Each scenario shifts the
-//    logit forecast by the EXACT dilution shift, with an earner-import correction
-//    estimated from past refreshes (saturated trophies stay saturated).
-//  * Quantiles come from the mixture CDF, inverted by bisection — one honest
-//    distribution, not a median plus an ad-hoc fan. Pinball loss on the logit
-//    scoring rule, so honest quantiles are the right target, not a bet on one branch.
-//  * Deterministic: fixed quadrature, no randomness, no clock, no network. The
-//    program is a pure function of the case file.
+// Model (logit space, NOT earners/players):
+// - A refresh jumps players_tracked and shifts every rate down. The shift is
+//   RATE-DEPENDENT: s = import(L) * (kappa-1)/5.06 - ln(kappa), where kappa is
+//   that refresh's player jump, L = logit(rate), and import(L) = a + b*L.
+//   This is an empirical transition model calibrated at kappa = 6.06 (the
+//   launch-night first refresh): there it reduces exactly to the fitted law
+//   s = -0.50 + 0.24*L (a0 = -0.50 + ln(6.06) = 1.302, b0 = 0.24). At
+//   kappa = 1 the shift is 0, as it must be. The -ln(kappa) term is the
+//   small-rate dilution approximation; the import term absorbs the rest.
+//   (a, b) are estimated from OBSERVED refreshes in the case's own history
+//   (corrected regression, see fitImport), shrunk toward the prior.
+// - Trend: within-segment logit-vs-log-time slope (demeaned per segment, so
+//   refresh steps do not pollute it), shrunk to the tier mean, clamped >= 0.
+// - Expected future refreshes N from a renewal-style rule (next refresh due
+//   at dueIn, then Poisson at rate lambda). Total future player growth
+//   kappa_total from a power-law extrapolation (prior 6.06x when no refresh
+//   observed). Shifts are compounded step by step over round(N) steps.
+// - Spread: Normal-in-logit, asymmetric (wider down), sigma from trend +
+//   refresh-count + parameter + partition uncertainty. Narrow on practice
+//   (~0.5 logit q05-q95), wider on the 4.5-day final.
+// - Deterministic: pure function of the case file. No randomness, no clock,
+//   no network. Node 22 stdlib only (node:fs, node:path).
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import * as fs from "node:fs";
+import * as path from "node:path";
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+// ---------------------------------------------------------------------------
+// Constants (priors — fitted from OUR OWN account-2 entry's public dev grade,
+// NOT from any other entry: loss 0.38, typical miss 0.15pp, coverage 0.9818).
+// ---------------------------------------------------------------------------
+const KREF = 6.06; // reference first-refresh player jump (638 -> 3868)
+const A0 = 1.302; // prior import intercept: -0.50 + ln(6.06)
+const B0 = 0.24; // prior import slope on logit(rate)
+const PRIOR_INTERVAL_H = 4.5; // prior inter-refresh interval, hours
+const Z = [-1.645, -0.674, 0, 0.674, 1.645]; // normal quantiles, levels .05/.25/.5/.75/.95
 
-/** The quantile levels the contest scores, in the order each row lists them. */
-const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-/** Random-walk spread of a logit's move, in logit units per square-root day. */
-const SIGMA_RW = 0.4;
-/** Prior refresh hazard: one refresh per HAZARD_PRIOR_HOURS, blended with history. */
-const HAZARD_PRIOR_HOURS = 8;
-/** Prior refresh size when no jump was ever observed: lognormal median. */
-const KAPPA_PRIOR_MEDIAN = 4;
-/** Prior refresh size spread (log sd) when no jump was ever observed. */
-const KAPPA_PRIOR_LOGSD = 0.7;
-/** Quadrature points for the refresh-size distribution (equal weights). */
-const KAPPA_GRID_N = 9;
-
-const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
-/** logit of a percent, clamped to the scorer's 0.01..99.99 range first. */
-const logit = (pct: number): number => {
-  const p = clamp(pct, 0.01, 99.99) / 100;
-  return Math.log(p / (1 - p));
-};
-/** Inverse logit: logit units back to percent. */
-const logistic = (l: number): number => 100 / (1 + Math.exp(-l));
-/** x rounded to 4 decimals. */
-const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
-
-/** Standard normal CDF (Abramowitz & Stegun 7.1.26, |error| < 1.5e-7). */
-const normCdf = (x: number): number => {
-  const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989422804014327 * Math.exp(-(x * x) / 2);
-  const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-  return x > 0 ? 1 - p : p;
-};
-/** Fixed standard-normal quantiles for the equal-weight quadrature grid. */
-const normQuantile = (p: number): number => {
-  // Acklam's approximation (good to ~1e-9 relative); deterministic, no tables.
-  const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285984469534e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239];
-  const b = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
-  const c = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
-  const d = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
-  const pLow = 0.02425;
-  if (p < pLow) {
-    const q = Math.sqrt(-2 * Math.log(p));
-    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-  }
-  if (p > 1 - pLow) {
-    const q = Math.sqrt(-2 * Math.log(1 - p));
-    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-  }
-  const q = p - 0.5;
-  const r = q * q;
-  return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
-};
-
-interface TrophyInfo { id: number; tier: string }
-interface ReadInfo { atMs: number; players: number; rates: Array<number | null> }
-interface Case {
-  id: string;
-  horizonMinutes: number;
-  trophies: TrophyInfo[];
-  history: ReadInfo[];
+// ---------------------------------------------------------------------------
+// Small numeric helpers
+// ---------------------------------------------------------------------------
+function clamp(x: number, lo: number, hi: number): number {
+  return x < lo ? lo : x > hi ? hi : x;
 }
 
-/** log-time coordinate: ln(1 + hours since the case's first read). */
-const logTime = (atMs: number, firstMs: number): number =>
-  Math.log(1 + Math.max(0, (atMs - firstMs) / 3_600_000));
+// Logit of a rate given in percent; rate clamped to [0.01, 99.99] first.
+function logitPct(rate: number): number {
+  const p = clamp(rate, 0.01, 99.99) / 100;
+  return Math.log(p / (1 - p));
+}
 
-/**
- * Within-refresh-segment slope of logit(rate) vs log-time.
- * Reads are grouped into segments of constant players_tracked; demeaning inside
- * each segment removes the dilution steps, so the pooled slope is pure unlock
- * growth. Returns the slope, its standard error, and the information Sxx.
- */
-const withinSegmentSlope = (
-  xs: number[], ys: Array<number | null>, seg: number[],
-): { slope: number; se: number; sxx: number; n: number } => {
-  const bySeg = new Map<number, number[]>();
-  xs.forEach((_, j) => {
-    if (ys[j] === null || ys[j] === undefined) return;
-    const list = bySeg.get(seg[j]) ?? [];
-    list.push(j);
-    bySeg.set(seg[j], list);
-  });
+// Inverse logit, returned as a percent in [0.01, 99.99].
+function invLogitPct(l: number): number {
+  const x = clamp(l, -9.21, 9.21);
+  return clamp(100 / (1 + Math.exp(-x)), 0.01, 99.99);
+}
+
+function round4(x: number): number {
+  const r = Math.round(x * 10000) / 10000;
+  return r === 0 ? 0 : r; // avoid -0
+}
+
+// Ordinary least squares: y = a + b*x. Returns { a, b }.
+function ols(xs: number[], ys: number[]): { a: number; b: number } {
+  const n = xs.length;
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i];
+    sy += ys[i];
+  }
+  const mx = sx / n;
+  const my = sy / n;
   let sxx = 0;
   let sxy = 0;
-  let n = 0;
-  const segMean = new Map<number, { mx: number; my: number }>();
-  for (const idxs of bySeg.values()) {
-    if (idxs.length < 2) continue;
-    const mx = idxs.reduce((a, j) => a + xs[j], 0) / idxs.length;
-    const my = idxs.reduce((a, j) => a + (ys[j] as number), 0) / idxs.length;
-    segMean.set(seg[idxs[0]], { mx, my });
-    for (const j of idxs) {
-      sxx += (xs[j] - mx) * (xs[j] - mx);
-      sxy += (xs[j] - mx) * ((ys[j] as number) - my);
-    }
-    n += idxs.length;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx;
+    sxx += dx * dx;
+    sxy += dx * (ys[i] - my);
   }
-  if (sxx <= 1e-9 || n < 3) return { slope: 0, se: Infinity, sxx: 0, n };
-  const slope = sxy / sxx;
-  // Residual variance around the segment-demeaned fit.
-  let rss = 0;
-  let dof = 0;
-  for (const [s, idxs] of bySeg.entries()) {
-    if (idxs.length < 2) continue;
-    const { mx, my } = segMean.get(s) as { mx: number; my: number };
-    for (const j of idxs) {
-      const r = (ys[j] as number) - (my + slope * (xs[j] - mx));
-      rss += r * r;
-      dof += 1;
-    }
-    dof -= 1; // one segment mean estimated
-  }
-  dof -= 1; // the slope itself
-  const sigma2 = dof > 0 ? rss / dof : 0.25;
-  return { slope, se: Math.sqrt(Math.max(sigma2, 1e-4) / sxx), sxx, n };
-};
+  if (sxx < 1e-12) return { a: my, b: 0 };
+  const b = sxy / sxx;
+  return { a: my - b * mx, b };
+}
 
-/**
- * Precision-weighted mean of values with standard errors; each value also gets a
- * prior variance TAU2 so a very precise estimate cannot dominate completely.
- */
-const precisionMean = (vals: number[], ses: number[], tau2 = 0.25): number => {
-  let wSum = 0;
-  let vSum = 0;
-  vals.forEach((v, i) => {
-    const w = 1 / (ses[i] * ses[i] + tau2);
-    wSum += w;
-    vSum += w * v;
-  });
-  return wSum > 0 ? vSum / wSum : 0;
-};
-
-/**
- * Shrink per-trophy slopes toward tier means, tier means toward the global mean.
- * Weight depends on each slope's information (Sxx): a trophy with no within-segment
- * variation borrows its tier mean entirely. Slopes are clamped at 0 only AFTER
- * shrinkage, so the tier means are not biased upward by pre-clamping.
- */
-const pooledSlopes = (
-  fits: Array<{ slope: number; se: number; sxx: number }>,
-  tiers: string[],
-): number[] => {
-  const global = precisionMean(
-    fits.map((f) => f.slope),
-    fits.map((f) => f.se),
-  );
-  const tierMean = new Map<string, number>();
-  for (const tier of new Set(tiers)) {
-    const idxs = tiers.map((t, i) => (t === tier ? i : -1)).filter((i) => i >= 0);
-    const raw = precisionMean(
-      idxs.map((i) => fits[i].slope),
-      idxs.map((i) => fits[i].se),
-    );
-    // Small tiers (platinum n=1, gold n=2) borrow from the global mean.
-    const k = 3; // pseudo-count
-    tierMean.set(tier, (idxs.length * raw + k * global) / (idxs.length + k));
+// Weighted least squares: y = a + b*x, weights ws. Returns { a, b }.
+function wols(xs: number[], ys: number[], ws: number[]): { a: number; b: number } {
+  let sw = 0;
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sw += ws[i];
+    sx += ws[i] * xs[i];
+    sy += ws[i] * ys[i];
   }
-  return fits.map((f, i) => {
-    const w = f.sxx / (f.sxx + 0.5); // information weight, 0 when no signal
-    const shrunk = w * f.slope + (1 - w) * (tierMean.get(tiers[i]) ?? global);
-    return Math.max(0, shrunk);
-  });
-};
-
-/** Player-count refresh analysis over the case history. */
-const analysePlayers = (
-  reads: ReadInfo[],
-  xs: number[],
-  xLast: number,
-  xTarget: number,
-  horizonHours: number,
-): {
-  q0: number; // P(no refresh before the target)
-  muLogD: number; // centre of the total log-dilution distribution
-  sdLogD: number; // spread of the total log-dilution distribution
-  jumps: Array<{ kappa: number; before: number; after: number }>;
-} => {
-  const jumps: Array<{ kappa: number; before: number; after: number }> = [];
-  for (let j = 0; j + 1 < reads.length; j++) {
-    const before = reads[j].players;
-    const after = reads[j + 1].players;
-    if (before > 0 && after > before * 1.0001) {
-      jumps.push({ kappa: after / before, before, after });
-    }
-  }
-  const spanHours = reads.length > 1
-    ? (reads[reads.length - 1].atMs - reads[0].atMs) / 3_600_000
-    : 0;
-  // Refresh hazard: observed jumps plus a prior of one refresh per
-  // HAZARD_PRIOR_HOURS, so a flat history still expects refreshes eventually.
-  const lambda = (jumps.length + 1) / (Math.max(0, spanHours) + HAZARD_PRIOR_HOURS);
-  const q0 = Math.exp(-lambda * horizonHours);
-  if (jumps.length === 0) {
-    // No jump ever seen: dilution comes from the prior alone.
-    return { q0, muLogD: Math.log(KAPPA_PRIOR_MEDIAN), sdLogD: KAPPA_PRIOR_LOGSD, jumps };
-  }
-  // Players trend: OLS of log(players) on log-time; extrapolate to the target.
-  const n = reads.length;
-  const mx = xs.reduce((a, x) => a + x, 0) / n;
-  const my = reads.reduce((a, r) => a + Math.log(Math.max(1, r.players)), 0) / n;
+  if (sw < 1e-12) return { a: 0, b: 0 };
+  const mx = sx / sw;
+  const my = sy / sw;
   let sxx = 0;
   let sxy = 0;
-  reads.forEach((r, j) => {
-    sxx += (xs[j] - mx) * (xs[j] - mx);
-    sxy += (xs[j] - mx) * (Math.log(Math.max(1, r.players)) - my);
-  });
-  const slopeP = sxx > 1e-9 ? Math.max(0, sxy / sxx) : 0;
-  const dTrend = Math.exp(slopeP * (xTarget - xLast));
-  // Scatter of log(players) around its trend line: the dilution uncertainty.
-  let rss = 0;
-  reads.forEach((r, j) => {
-    const fit = my + slopeP * (xs[j] - mx);
-    const res = Math.log(Math.max(1, r.players)) - fit;
-    rss += res * res;
-  });
-  const sdLogD = clamp(Math.sqrt(rss / Math.max(1, n - 2)), 0.3, 1.5);
-  return { q0, muLogD: Math.log(Math.max(1, dTrend)), sdLogD, jumps };
-};
+  for (let i = 0; i < xs.length; i++) {
+    const dx = xs[i] - mx;
+    sxx += ws[i] * dx * dx;
+    sxy += ws[i] * dx * (ys[i] - my);
+  }
+  if (sxx < 1e-12) return { a: my, b: 0 };
+  const b = sxy / sxx;
+  return { a: my - b * mx, b };
+}
 
-/**
- * Earner-import rate per trophy: the share of the new players a refresh brings
- * who already hold the trophy. Estimated from observed refreshes; 0 when none
- * were seen (new players start fresh), except a saturated trophy (rate >= 99.5%),
- * which new players hold immediately too.
- */
-const earnerImport = (
-  c: Case,
-  jumps: Array<{ kappa: number; before: number; after: number }>,
-  reads: ReadInfo[],
-): number[] => {
-  return c.trophies.map((_, i) => {
-    const last = lastNonNullRate(reads, i);
-    if (last >= 99.5) return 1;
-    if (jumps.length === 0) return 0;
-    const est: number[] = [];
-    for (let j = 0; j + 1 < reads.length; j++) {
-      const before = reads[j].players;
-      const after = reads[j + 1].players;
-      if (!(before > 0 && after > before * 1.0001)) continue;
-      const pBefore = reads[j].rates[i];
-      const pAfter = reads[j + 1].rates[i];
-      if (pBefore === null || pAfter === null) continue;
-      const kappa = after / before;
-      est.push(clamp(((pAfter / 100) * kappa - pBefore / 100) / (kappa - 1), 0, 1));
+// ---------------------------------------------------------------------------
+// Case types (plain data, no behaviour)
+// ---------------------------------------------------------------------------
+interface Trophy {
+  id: number;
+  name: string;
+  tier: string;
+}
+interface Read {
+  at: string;
+  atMs: number;
+  players: number;
+  rates: (number | null)[];
+}
+interface CaseData {
+  id: string;
+  at: string;
+  atMs: number;
+  horizonMinutes: number;
+  target: string;
+  targetMs: number;
+  trophies: Trophy[];
+  history: Read[];
+  releaseMs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Refresh detection: any increase in players_tracked between consecutive
+// reads is a refresh (the counts are exact integers from the page, so there
+// is no measurement noise to threshold against). Splits history into segments.
+// ---------------------------------------------------------------------------
+interface Refresh {
+  kappa: number; // players_after / players_before
+  beforeIdx: number; // index of last read before the jump
+  afterIdx: number; // index of first read after the jump
+  afterMs: number;
+}
+
+function detectRefreshes(history: Read[]): { segments: number[][]; refreshes: Refresh[] } {
+  const segments: number[][] = [];
+  const refreshes: Refresh[] = [];
+  let cur: number[] = [];
+  for (let k = 0; k < history.length; k++) {
+    if (k > 0 && history[k].players > history[k - 1].players) {
+      segments.push(cur);
+      cur = [];
+      refreshes.push({
+        kappa: history[k].players / history[k - 1].players,
+        beforeIdx: k - 1,
+        afterIdx: k,
+        afterMs: history[k].atMs,
+      });
     }
-    if (est.length === 0) return 0;
-    est.sort((a, b) => a - b);
-    return est[Math.floor(est.length / 2)];
-  });
-};
-
-/** Most recent non-null rate for a trophy (scanning back), else 0.01. */
-const lastNonNullRate = (reads: ReadInfo[], i: number): number => {
-  for (let j = reads.length - 1; j >= 0; j--) {
-    const r = reads[j].rates[i];
-    if (r !== null && r !== undefined) return r;
+    cur.push(k);
   }
-  return 0.01;
-};
+  segments.push(cur);
+  return { segments, refreshes };
+}
 
-/**
- * The five quantiles of one trophy's rate at the target, from the refresh
- * scenario mixture. Components: a no-refresh branch (weight q0) and refresh
- * sub-branches over a quadrature of the total log-dilution (weight 1-q0).
- * Each component is Normal(mu, sigmaRw) in logit space; the mixture CDF is
- * inverted on a fixed logit grid. Fully deterministic.
- */
-const forecastTrophy = (
-  trendLogit: number,
-  eImport: number,
-  q0: number,
-  muLogD: number,
-  sdLogD: number,
-  sigmaRw: number,
-): number[] => {
-  interface Comp { w: number; mu: number }
-  const comps: Comp[] = [{ w: q0, mu: trendLogit }];
-  // The dilution applies to the rate AT the target (after trend growth), not
-  // to the last rate: p' = (p_trend + e*(D-1)) / D, in exact logit terms.
-  const pTrend = clamp(logistic(trendLogit), 0.01, 99.99) / 100;
-  for (let k = 0; k < KAPPA_GRID_N; k++) {
-    const z = normQuantile((k + 0.5) / KAPPA_GRID_N);
-    const d = Math.exp(muLogD + sdLogD * z);
-    const pNew = clamp((pTrend + eImport * (d - 1)) / d, 0.0001, 0.9999);
-    const mu = logit(pNew * 100);
-    comps.push({ w: (1 - q0) / KAPPA_GRID_N, mu });
+// ---------------------------------------------------------------------------
+// Fit the import law import(L) = a + b*L from OBSERVED refreshes.
+//
+// For a refresh j with jump kappa_j, trophy i shifts by
+//   s_ij = import(L_i) * (kappa_j - 1) / (KREF - 1) - ln(kappa_j),
+// so  (s_ij + ln(kappa_j)) / w_j = a + b * L_i   with w_j = (kappa_j-1)/5.06.
+// The correct regression is therefore z = (s + ln kappa)/w on L, weighted by
+// w^2 (the variance of z grows as 1/w^2, so small jumps are weak evidence).
+// Regressing (s + ln kappa) on L with weights w would be WRONG: it fits a
+// quantity scaled by w. Saturated trophies (rate >= 99.5%) are excluded:
+// their shift is 0 by construction and would corrupt the fit.
+// Falls back to the prior when there is nothing identifiable (no refresh, too
+// few points, or the observed L range is too narrow to identify the slope).
+// ---------------------------------------------------------------------------
+function fitImport(
+  history: Read[],
+  refreshes: Refresh[],
+  trophies: Trophy[]
+): { a: number; b: number; nRef: number } {
+  const nRef = refreshes.length;
+  if (nRef === 0) return { a: A0, b: B0, nRef: 0 };
+
+  const xs: number[] = [];
+  const ys: number[] = [];
+  const ws: number[] = [];
+  for (const r of refreshes) {
+    const w = (r.kappa - 1) / (KREF - 1);
+    if (w < 0.02) continue; // jump too small to say anything
+    const before = history[r.beforeIdx].rates;
+    const after = history[r.afterIdx].rates;
+    for (let i = 0; i < trophies.length; i++) {
+      const rb = before[i];
+      const ra = after[i];
+      if (rb === null || ra === null) continue;
+      if (rb >= 99.5 || ra >= 99.5) continue; // saturated: skip
+      const L = logitPct(rb);
+      const s = logitPct(ra) - L;
+      const z = (s + Math.log(r.kappa)) / w;
+      // z must stay in a sane range; a wild z means a corrupted read.
+      if (!isFinite(z) || z < -5 || z > 10) continue;
+      xs.push(L);
+      ys.push(z);
+      ws.push(w * w);
+    }
   }
-  const sd = Math.max(sigmaRw, 0.05);
-  // Mixture CDF, inverted by bisection: no fixed grid, so a quantile can never
-  // silently collapse onto a grid endpoint. Brackets widen until they straddle
-  // the target, then 80 bisection steps pin it to ~1e-5 logit. Deterministic.
-  const mixCdf = (x: number): number => {
-    let s = 0;
-    for (const comp of comps) s += comp.w * normCdf((x - comp.mu) / sd);
-    return s;
+  if (xs.length < 10) return { a: A0, b: B0, nRef };
+  let lMin = Infinity;
+  let lMax = -Infinity;
+  for (const x of xs) {
+    if (x < lMin) lMin = x;
+    if (x > lMax) lMax = x;
+  }
+  if (lMax - lMin < 1.0) return { a: A0, b: B0, nRef }; // slope unidentified
+  const fit = wols(xs, ys, ws);
+  const aHat = clamp(fit.a, 0, 3);
+  const bHat = clamp(fit.b, 0, 0.6);
+  // Shrink toward the prior, weighted by how many refreshes were observed.
+  const wShrink = nRef / (nRef + 2);
+  return {
+    a: wShrink * aHat + (1 - wShrink) * A0,
+    b: wShrink * bHat + (1 - wShrink) * B0,
+    nRef,
   };
-  return LEVELS.map((tau) => {
-    let lo = trendLogit - 12;
-    let hi = trendLogit + 6;
-    while (mixCdf(lo) > tau) lo -= 6;
-    while (mixCdf(hi) < tau) hi += 6;
-    for (let it = 0; it < 80; it++) {
-      const mid = (lo + hi) / 2;
-      if (mixCdf(mid) < tau) lo = mid; else hi = mid;
-    }
-    return round4(clamp(logistic((lo + hi) / 2), 0.01, 99.99));
-  });
-};
+}
 
-/** Forecast one case: five quantiles per trophy. */
-const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
-  const firstMs = c.history[0].atMs;
-  const lastMs = c.history[c.history.length - 1].atMs;
-  const xs = c.history.map((r) => logTime(r.atMs, firstMs));
-  const xLast = xs[xs.length - 1];
-  const xTarget = logTime(lastMs + c.horizonMinutes * 60_000, firstMs);
-  const horizonHours = c.horizonMinutes / 60;
-  const horizonDays = c.horizonMinutes / 1440;
+// ---------------------------------------------------------------------------
+// Trend: within-segment logit-vs-log-time slope per trophy.
+// x = ln(1 + hours since release). Demeaning per segment removes refresh
+// steps, so the slope is pure unlock growth. Shrunk toward the tier mean,
+// clamped >= 0 AFTER shrinkage. Flat history -> slope 0.
+// ---------------------------------------------------------------------------
+function fitTrend(
+  cs: CaseData,
+  segments: number[][]
+): { slopes: number[]; xLast: number; xTarget: number } {
+  const n = cs.trophies.length;
+  const slopes = new Array<number>(n).fill(0);
+  const xOf = (ms: number): number => {
+    const h = (ms - cs.releaseMs) / 3600000;
+    return Math.log(1 + Math.max(-0.9, h));
+  };
+  const xLast = xOf(cs.history[cs.history.length - 1].atMs);
+  const xTarget = xOf(cs.targetMs);
 
-  // Refresh segments: a new segment starts whenever players_tracked changes.
-  const seg: number[] = [];
-  let s = 0;
-  c.history.forEach((r, j) => {
-    if (j > 0 && r.players !== c.history[j - 1].players) s++;
-    seg.push(s);
-  });
-
-  // Per-trophy within-segment logit trend, pooled by tier.
-  const fits = c.trophies.map((_, i) => {
-    const ys = c.history.map((r) => {
-      const v = r.rates[i];
-      return v === null || v === undefined ? null : logit(v);
-    });
-    return withinSegmentSlope(xs, ys, seg);
-  });
-  const slopes = pooledSlopes(fits, c.trophies.map((t) => t.tier));
-
-  const players = analysePlayers(c.history, xs, xLast, xTarget, horizonHours);
-  const eImports = earnerImport(c, players.jumps, c.history);
-  const sigmaRw = SIGMA_RW * Math.sqrt(Math.max(0, horizonDays));
-
-  return c.trophies.map((t, i) => {
-    const lastRate = lastNonNullRate(c.history, i);
-    const trendLogit = logit(lastRate) + slopes[i] * (xTarget - xLast);
-    let q = forecastTrophy(trendLogit, eImports[i], players.q0, players.muLogD, players.sdLogD, sigmaRw);
-    // Enforce non-decreasing quantiles after rounding.
-    for (let k = 1; k < q.length; k++) q[k] = Math.max(q[k], q[k - 1]);
-    return { id: t.id, q };
-  });
-};
-
-const main = (): void => {
-  mkdirSync(OUTPUT_DIR, { recursive: true });
-  const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-  for (const file of inputs) {
-    const raw = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as {
-      id: string;
-      horizon_minutes: number;
-      levels: number[];
-      trophies: Array<{ id: number; tier: string }>;
-      history: Array<{ at: string; players_tracked: number; rates: Array<number | null> }>;
-    };
-    if (raw.levels.length !== LEVELS.length || raw.levels.some((t, j) => t !== LEVELS[j])) {
-      throw new Error(`${file} asks for levels ${JSON.stringify(raw.levels)}, not ${JSON.stringify(LEVELS)}`);
-    }
-    if (!raw.history || raw.history.length === 0) throw new Error(`${file} has no history`);
-    if (!Number.isFinite(raw.horizon_minutes) || raw.horizon_minutes <= 0) {
-      throw new Error(`${file} has a non-positive horizon`);
-    }
-    for (const r of raw.history) {
-      if (!Number.isFinite(r.players_tracked) || r.players_tracked <= 0) {
-        throw new Error(`${file} has a bad players_tracked value`);
+  // Per-trophy pooled within-segment OLS slope.
+  const nEff = new Array<number>(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    let sxx = 0;
+    let sxy = 0;
+    let cnt = 0;
+    for (const seg of segments) {
+      const pts: { x: number; y: number }[] = [];
+      for (const k of seg) {
+        const r = cs.history[k].rates[i];
+        if (r === null || r >= 99.5) continue; // saturated: no slope signal
+        pts.push({ x: xOf(cs.history[k].atMs), y: logitPct(r) });
       }
-      for (const v of r.rates) {
-        if (v !== null && v !== undefined && (!Number.isFinite(v) || v < 0 || v > 100)) {
-          throw new Error(`${file} has a rate outside 0..100`);
-        }
+      if (pts.length < 2) continue;
+      let mx = 0;
+      let my = 0;
+      for (const p of pts) {
+        mx += p.x;
+        my += p.y;
+      }
+      mx /= pts.length;
+      my /= pts.length;
+      for (const p of pts) {
+        const dx = p.x - mx;
+        sxx += dx * dx;
+        sxy += dx * (p.y - my);
+        cnt++;
       }
     }
-    const c: Case = {
-      id: raw.id,
-      horizonMinutes: raw.horizon_minutes,
-      trophies: raw.trophies.map((t) => ({ id: t.id, tier: t.tier })),
-      history: raw.history.map((r) => ({
-        atMs: Date.parse(r.at),
-        players: r.players_tracked,
-        rates: r.rates,
-      })),
-    };
-    if (c.history.some((r) => Number.isNaN(r.atMs))) {
-      throw new Error(`${file} has an unreadable timestamp in its history`);
-    }
-    const trophies = forecastCase(c);
-    writeFileSync(join(OUTPUT_DIR, `${c.id}.out`), `${JSON.stringify({ trophies })}\n`);
+    nEff[i] = cnt;
+    slopes[i] = sxx > 1e-9 ? sxy / sxx : 0;
   }
-};
+
+  // Tier means, then shrink each slope toward its tier mean.
+  const tiers = ["platinum", "gold", "silver", "bronze"];
+  const tierMean = new Map<string, number>();
+  for (const t of tiers) {
+    let s = 0;
+    let c = 0;
+    for (let i = 0; i < n; i++) {
+      if (cs.trophies[i].tier === t && nEff[i] > 0) {
+        s += slopes[i];
+        c++;
+      }
+    }
+    tierMean.set(t, c > 0 ? s / c : 0);
+  }
+  for (let i = 0; i < n; i++) {
+    const tm = tierMean.get(cs.trophies[i].tier) ?? 0;
+    const w = nEff[i] / (nEff[i] + 4);
+    slopes[i] = Math.max(0, w * slopes[i] + (1 - w) * tm);
+  }
+  return { slopes, xLast, xTarget };
+}
+
+// ---------------------------------------------------------------------------
+// Expected future refresh count N (renewal-style rule).
+// The next refresh is due at dueIn = max(1h, I - staleness), where I is the
+// inter-refresh interval (prior 4.5h, or the mean observed interval) and
+// staleness is the hours since the last refresh (or page creation). If the
+// horizon runs past the due time, count 1 refresh plus Poisson arrivals at
+// rate lambda thereafter; if it ends before, the expected count is the
+// fraction horizon/dueIn. Continuous at horizon == dueIn (both give 1).
+// ---------------------------------------------------------------------------
+function expectedRefreshes(
+  cs: CaseData,
+  refreshes: Refresh[]
+): { n: number; lambda: number } {
+  const firstMs = cs.history[0].atMs;
+  const lastMs = cs.history[cs.history.length - 1].atMs;
+  const spanH = Math.max(0.1, (lastMs - firstMs) / 3600000);
+  const nRef = refreshes.length;
+  const lambda = (nRef + 1) / (spanH + PRIOR_INTERVAL_H);
+
+  // Inter-refresh interval: mean of [page-creation -> 1st refresh, gaps...].
+  let interval = PRIOR_INTERVAL_H;
+  if (nRef >= 1) {
+    const times = refreshes.map((r) => r.afterMs);
+    const gaps: number[] = [(times[0] - firstMs) / 3600000];
+    for (let j = 1; j < times.length; j++) gaps.push((times[j] - times[j - 1]) / 3600000);
+    let g = 0;
+    for (const x of gaps) g += x;
+    interval = g / gaps.length;
+    if (!isFinite(interval) || interval <= 0) interval = PRIOR_INTERVAL_H;
+  }
+
+  // Staleness: hours since the last refresh (or since the first read).
+  const lastRefreshMs = nRef > 0 ? refreshes[refreshes.length - 1].afterMs : firstMs;
+  const staleness = Math.max(0, (cs.atMs - lastRefreshMs) / 3600000);
+  const dueIn = Math.max(1.0, interval - staleness);
+  const horizonH = cs.horizonMinutes / 60;
+  const n =
+    horizonH > dueIn ? 1 + lambda * (horizonH - dueIn) : horizonH / dueIn;
+  return { n: clamp(n, 0, 40), lambda };
+}
+
+// ---------------------------------------------------------------------------
+// Total future player growth kappa_total = P(target) / P(now).
+// With >= 2 segments, fit a power law ln(P) = c + gamma*ln(1+hours) to the
+// segment-start player counts and extrapolate to the target (clamped to at
+// most 20x growth). With a single segment (no refresh observed) there is
+// nothing to fit: use the prior first-refresh jump, 6.06x.
+// ---------------------------------------------------------------------------
+function totalPlayerGrowth(
+  cs: CaseData,
+  segments: number[][]
+): number {
+  const pNow = cs.history[cs.history.length - 1].players;
+  if (segments.length < 2) return KREF;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const seg of segments) {
+    if (seg.length === 0) continue;
+    const read = cs.history[seg[0]];
+    const h = (read.atMs - cs.releaseMs) / 3600000;
+    xs.push(Math.log(1 + Math.max(-0.9, h)));
+    ys.push(Math.log(Math.max(1, read.players)));
+  }
+  if (xs.length < 2) return KREF;
+  const fit = ols(xs, ys);
+  if (!isFinite(fit.b) || fit.b <= 0) return 1; // no growth fitted
+  const hT = (cs.targetMs - cs.releaseMs) / 3600000;
+  const pTarget = Math.exp(fit.a + fit.b * Math.log(1 + Math.max(-0.9, hT)));
+  if (!isFinite(pTarget)) return KREF;
+  return clamp(pTarget / Math.max(1, pNow), 1, 20);
+}
+
+// ---------------------------------------------------------------------------
+// One refresh step: s = import(L) * (kappa-1)/5.06 - ln(kappa), clamped.
+// import(L) uses L clamped to [-6, 9.21] so it cannot explode at the edges.
+// ---------------------------------------------------------------------------
+function shiftStep(L: number, kappa: number, a: number, b: number): number {
+  const lc = clamp(L, -6, 9.21);
+  const imp = a + b * lc;
+  const s = imp * ((kappa - 1) / (KREF - 1)) - Math.log(kappa);
+  return clamp(s, -3, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Forecast one trophy: trend + compounded refresh shifts, with a partition
+// guard (stepped vs single aggregate jump) and a narrow asymmetric spread.
+// Returns the five quantiles in percent.
+// ---------------------------------------------------------------------------
+function forecastTrophy(
+  lastRate: number,
+  slope: number,
+  dxTrend: number,
+  a: number,
+  b: number,
+  steps: number,
+  kappaStep: number,
+  kappaTotal: number,
+  sig: { up: number; down: number }
+): number[] {
+  if (lastRate >= 99.5) {
+    // Saturated: stays ~99.99 whatever happens.
+    return [99.98, 99.99, 99.99, 99.99, 99.99];
+  }
+  const l0 = logitPct(lastRate);
+  // Trend first (unlock growth), then refresh shifts on top.
+  let lTrend = clamp(l0 + slope * dxTrend, -9.21, 9.21);
+
+  // Stepped compounding: recompute L after each shift.
+  let lStep = lTrend;
+  for (let k = 0; k < steps; k++) {
+    lStep += shiftStep(lStep, kappaStep, a, b);
+    lStep = clamp(lStep, -9.21, 9.21);
+  }
+  // Guard the total refresh shift (never annihilate the rate).
+  if (lStep - lTrend < -4) lStep = lTrend - 4;
+  if (lStep - lTrend > 1) lStep = lTrend + 1;
+
+  // Single aggregate jump with the same total growth (partition check).
+  const lAgg = clamp(lTrend + shiftStep(lTrend, kappaTotal, a, b), -9.21, 9.21);
+  let lMed = lStep;
+  let sigUp = sig.up;
+  let sigDown = sig.down;
+  const diff = Math.abs(lStep - lAgg);
+  if (diff > 0.3) {
+    // The two partitions disagree: average them and widen the spread.
+    lMed = (lStep + lAgg) / 2;
+    const extra = diff / 2;
+    sigUp = Math.sqrt(sigUp * sigUp + extra * extra);
+    sigDown = Math.sqrt(sigDown * sigDown + extra * extra);
+  }
+
+  const med = invLogitPct(lMed);
+  const q: number[] = [0, 0, 0, 0, 0];
+  // q05/q25 use sigmaDown (wider below), q75/q95 use sigmaUp.
+  q[0] = invLogitPct(lMed + Z[0] * sigDown);
+  q[1] = invLogitPct(lMed + Z[1] * sigDown);
+  q[2] = med;
+  q[3] = invLogitPct(lMed + Z[3] * sigUp);
+  q[4] = invLogitPct(lMed + Z[4] * sigUp);
+  // Enforce non-decreasing (clamping can tie neighbours, never invert).
+  for (let i = 1; i < 5; i++) if (q[i] < q[i - 1]) q[i] = q[i - 1];
+  return q.map(round4);
+}
+
+// ---------------------------------------------------------------------------
+// Process one case file -> forecast rows.
+// ---------------------------------------------------------------------------
+function processCase(raw: any): { id: string; trophies: { id: number; q: number[] }[] } {
+  const history: Read[] = (raw.history as any[]).map((h: any) => ({
+    at: h.at,
+    atMs: Date.parse(h.at),
+    players: h.players_tracked,
+    rates: (h.rates as (number | null)[]).slice(),
+  }));
+  const trophies: Trophy[] = (raw.trophies as any[]).map((t: any) => ({
+    id: t.id,
+    name: t.name,
+    tier: t.tier,
+  }));
+  const cs: CaseData = {
+    id: raw.id,
+    at: raw.at,
+    atMs: Date.parse(raw.at),
+    horizonMinutes: raw.horizon_minutes,
+    target: raw.target,
+    targetMs: Date.parse(raw.target),
+    trophies,
+    history,
+    releaseMs: Date.parse((raw.game?.release_date ?? "2026-11-19") + "T00:00:00Z"),
+  };
+
+  const { segments, refreshes } = detectRefreshes(cs.history);
+  const imp = fitImport(cs.history, refreshes, cs.trophies);
+  const trend = fitTrend(cs, segments);
+  const dxTrend = trend.xTarget - trend.xLast;
+  const exp = expectedRefreshes(cs, refreshes);
+  const kappaTotal = totalPlayerGrowth(cs, segments);
+  const steps = Math.max(1, Math.round(exp.n));
+  const kappaStep = Math.pow(kappaTotal, 1 / steps);
+
+  // Spread components (logit sigma). Calibrated so q05-q95 is ~0.5 logit
+  // on a 90-minute practice horizon and wider on the 4.5-day final.
+  const horizonDays = cs.horizonMinutes / 1440;
+  const sigTrend = 0.15 * Math.sqrt(horizonDays);
+  const sigRefreshUp = 0.05 * Math.sqrt(exp.n);
+  const sigRefreshDown = 0.15 * Math.sqrt(exp.n);
+  const sigParam = 0.12 / Math.sqrt(1 + imp.nRef);
+  const sigUp = Math.sqrt(
+    sigTrend * sigTrend + sigRefreshUp * sigRefreshUp + sigParam * sigParam
+  );
+  const sigDown = Math.sqrt(
+    sigTrend * sigTrend + sigRefreshDown * sigRefreshDown + sigParam * sigParam
+  );
+
+  // Last non-null rate per trophy (scan back); fallback: median last rate.
+  const lastRates: number[] = [];
+  const lastReadRates = cs.history[cs.history.length - 1].rates;
+  const present = lastReadRates.filter((r): r is number => r !== null);
+  const fallback = present.length > 0 ? present.sort((x, y) => x - y)[Math.floor(present.length / 2)] : 1.0;
+  for (let i = 0; i < cs.trophies.length; i++) {
+    let r: number | null = null;
+    for (let k = cs.history.length - 1; k >= 0; k--) {
+      if (cs.history[k].rates[i] !== null) {
+        r = cs.history[k].rates[i] as number;
+        break;
+      }
+    }
+    lastRates.push(r === null ? fallback : r);
+  }
+
+  const rows: { id: number; q: number[] }[] = [];
+  for (let i = 0; i < cs.trophies.length; i++) {
+    const q = forecastTrophy(
+      lastRates[i],
+      trend.slopes[i],
+      dxTrend,
+      imp.a,
+      imp.b,
+      steps,
+      kappaStep,
+      kappaTotal,
+      { up: sigUp, down: sigDown }
+    );
+    rows.push({ id: cs.trophies[i].id, q });
+  }
+  return { id: cs.id, trophies: rows };
+}
+
+// ---------------------------------------------------------------------------
+// Entry point: read every *.in in the input dir (name order), write one
+// *.out per case to the output dir. Output JSON is exactly
+// {"trophies":[{"id":n,"q":[q05,q25,q50,q75,q95]}, ...]}.
+// ---------------------------------------------------------------------------
+function main(): void {
+  const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  fs.mkdirSync(outputDir, { recursive: true });
+  const files = fs
+    .readdirSync(inputDir)
+    .filter((f) => f.endsWith(".in"))
+    .sort();
+  for (const f of files) {
+    const raw = JSON.parse(fs.readFileSync(path.join(inputDir, f), "utf-8"));
+    const out = processCase(raw);
+    // Contract: EXACTLY {"trophies":[...]} — no other top-level keys.
+    const text = JSON.stringify({ trophies: out.trophies });
+    if (text.length > 65536) throw new Error(`output too large for ${out.id}`);
+    fs.writeFileSync(path.join(outputDir, out.id + ".out"), text, "utf-8");
+  }
+}
 
 main();
